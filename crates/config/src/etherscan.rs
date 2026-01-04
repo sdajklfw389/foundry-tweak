@@ -21,6 +21,24 @@ use std::{
 /// The user agent to use when querying the etherscan API.
 pub const ETHERSCAN_USER_AGENT: &str = concat!("foundry/", env!("CARGO_PKG_VERSION"));
 
+/// Converts V1 Etherscan API URLs to V2 format
+/// V1: https://api.etherscan.io/api
+/// V2: https://api.etherscan.io/v2/api
+fn convert_to_v2_url(url: &str) -> String {
+    // If already V2, return as is
+    if url.contains("/v2/api") {
+        return url.to_string();
+    }
+    // Replace /api at the end or before query params with /v2/api
+    if url.ends_with("/api") {
+        url.replace("/api", "/v2/api")
+    } else if url.contains("/api?") {
+        url.replace("/api?", "/v2/api?")
+    } else {
+        url.to_string()
+    }
+}
+
 /// A [Provider] that provides Etherscan API key from the environment if it's not empty.
 ///
 /// This prevents `ETHERSCAN_API_KEY=""` if it's set but empty
@@ -218,7 +236,7 @@ impl EtherscanConfig {
 
         match (chain, url) {
             (Some(chain), Some(api_url)) => Ok(ResolvedEtherscanConfig {
-                api_url,
+                api_url: convert_to_v2_url(&api_url),
                 browser_url: chain.etherscan_urls().map(|(_, url)| url.to_string()),
                 key,
                 chain: Some(chain),
@@ -228,7 +246,7 @@ impl EtherscanConfig {
                 EtherscanConfigError::UnknownChain(msg, chain)
             }),
             (None, Some(api_url)) => {
-                Ok(ResolvedEtherscanConfig { api_url, browser_url: None, key, chain: None })
+                Ok(ResolvedEtherscanConfig { api_url: convert_to_v2_url(&api_url), browser_url: None, key, chain: None })
             }
             (None, None) => {
                 let msg = alias
@@ -262,7 +280,7 @@ impl ResolvedEtherscanConfig {
         let chain = chain.into();
         let (api_url, browser_url) = chain.etherscan_urls()?;
         Some(Self {
-            api_url: api_url.to_string(),
+            api_url: convert_to_v2_url(&api_url.to_string()),
             browser_url: Some(browser_url.to_string()),
             key: api_key.into(),
             chain: Some(chain),
@@ -281,7 +299,7 @@ impl ResolvedEtherscanConfig {
     pub fn set_chain(&mut self, chain: impl Into<Chain>) -> &mut Self {
         let chain = chain.into();
         if let Some((api, browser)) = chain.etherscan_urls() {
-            self.api_url = api.to_string();
+            self.api_url = convert_to_v2_url(&api.to_string());
             self.browser_url = Some(browser.to_string());
         }
         self.chain = Some(chain);
@@ -296,10 +314,11 @@ impl ResolvedEtherscanConfig {
     {
         let Self { api_url, browser_url, key: api_key, chain } = self;
         let (mainnet_api, mainnet_url) = NamedChain::Mainnet.etherscan_urls().expect("exist; qed");
+        let mainnet_api_v2 = convert_to_v2_url(&mainnet_api.to_string());
 
         let cache = chain
             // try to match against mainnet, which is usually the most common target
-            .or_else(|| (api_url == mainnet_api).then(Chain::mainnet))
+            .or_else(|| (api_url == mainnet_api_v2 || api_url == mainnet_api.to_string()).then(Chain::mainnet))
             .and_then(Config::foundry_etherscan_chain_cache_dir);
 
         if let Some(cache_path) = &cache {
@@ -438,7 +457,7 @@ mod tests {
             "mainnet".to_string(),
             EtherscanConfig {
                 chain: Some(Mainnet.into()),
-                url: Some("https://api.etherscan.io/api".to_string()),
+                url: Some("https://api.etherscan.io/v2/api".to_string()),
                 key: EtherscanApiKey::Key("ABCDEFG".to_string()),
             },
         );
@@ -456,7 +475,7 @@ mod tests {
             "mainnet".to_string(),
             EtherscanConfig {
                 chain: Some(Mainnet.into()),
-                url: Some("https://api.etherscan.io/api".to_string()),
+                url: Some("https://api.etherscan.io/v2/api".to_string()),
                 key: EtherscanApiKey::Env(format!("${{{env}}}")),
             },
         );
@@ -482,7 +501,7 @@ mod tests {
             "blast_sepolia".to_string(),
             EtherscanConfig {
                 chain: None,
-                url: Some("https://api.etherscan.io/api".to_string()),
+                url: Some("https://api.etherscan.io/v2/api".to_string()),
                 key: EtherscanApiKey::Key("ABCDEFG".to_string()),
             },
         );
@@ -496,7 +515,7 @@ mod tests {
     fn resolve_etherscan_alias() {
         let config = EtherscanConfig {
             chain: None,
-            url: Some("https://api.etherscan.io/api".to_string()),
+            url: Some("https://api.etherscan.io/v2/api".to_string()),
             key: EtherscanApiKey::Key("ABCDEFG".to_string()),
         };
         let resolved = config.clone().resolve(Some("base_sepolia")).unwrap();

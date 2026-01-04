@@ -495,7 +495,7 @@ impl ChiselDispatcher {
                 }
 
                 let request_url = format!(
-                    "https://api.etherscan.io/api?module=contract&action=getabi&address={}{}",
+                    "https://api.etherscan.io/v2/api?module=contract&action=getabi&address={}{}",
                     args[0],
                     if let Some(api_key) =
                         self.source().config.foundry_config.etherscan_api_key.as_ref()
