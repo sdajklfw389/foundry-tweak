@@ -205,7 +205,7 @@ alloy-sol-macro-input = "0.7.3"
 alloy-sol-types = "0.7.3"
 syn-solidity = "0.7.3"
 
-alloy-chains = "0.1"
+alloy-chains = "=0.1.23"
 alloy-rlp = "0.3.3"
 alloy-trie = "0.4.1"
 

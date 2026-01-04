@@ -4081,6 +4081,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.14",
+ "tracing",
  "vergen",
  "yansi",
 ]
