@@ -21,7 +21,41 @@ pub fn decode_console_logs(logs: &[Log]) -> Vec<String> {
 /// This function returns [None] if it is not a DSTest log or the result of a Hardhat
 /// `console.log`.
 pub fn decode_console_log(log: &Log) -> Option<String> {
-    Console::ConsoleEvents::decode_log(log, false).ok().map(|decoded| decoded.to_string())
+    // Check if this looks like a console log
+    use crate::constants::HARDHAT_CONSOLE_ADDRESS;
+    let is_console_address = log.address == HARDHAT_CONSOLE_ADDRESS;
+    
+    if is_console_address {
+        tracing::debug!(
+            "decode_console_log: Attempting to decode log from console address, topics: {}, topic0: {:?}, data_len: {}",
+            log.topics().len(),
+            log.topics().first().map(|t| hex::encode(t.as_slice())),
+            log.data.data.len()
+        );
+    }
+    
+    match Console::ConsoleEvents::decode_log(log, false) {
+        Ok(decoded) => {
+            let decoded_str = decoded.to_string();
+            if is_console_address {
+                tracing::debug!("decode_console_log: Successfully decoded console log: {}", decoded_str);
+            }
+            Some(decoded_str)
+        },
+        Err(e) => {
+            if is_console_address {
+                tracing::warn!(
+                    "decode_console_log: Failed to decode console log from address {:?}, topics: {}, topic0: {:?}, data_len: {}, error: {}",
+                    log.address,
+                    log.topics().len(),
+                    log.topics().first().map(|t| hex::encode(t.as_slice())),
+                    log.data.data.len(),
+                    e
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Decodes revert data.

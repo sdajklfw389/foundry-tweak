@@ -22,7 +22,7 @@ use foundry_evm::opts::EvmOpts;
 
 use clap::Parser;
 use foundry_config::{find_project_root_path, Config};
-use foundry_tweak::{build_tweaked_backend, ClonedProject};
+use foundry_tweak::{build_tweaked_backend, ClonedProject, TweakData, TweakInfo};
 
 /// Replays an on-chain historical transaction locally on a fork of the blockchain with the on-chain
 /// contract tweaked by the current cloned project. In other words, `forge replay`:
@@ -98,21 +98,33 @@ impl ReplayArgs {
             .map_err(|e| eyre!("failed to load the cloned project: {}", e))?;
         let tweaked_addr = cloned_project.metadata.address;
         let tweaked_code = cloned_project.tweaked_code(&self.rpc, self.quick).await?;
+        let tweaked_abi = cloned_project.get_abi()?;
+        let tweaked_name = cloned_project.metadata.target_contract.clone();
 
         let figment = Config::figment_with_root(&root).merge(&self.rpc);
         let evm_opts = figment.extract::<EvmOpts>()?;
         let mut config = Config::try_from(figment)?.sanitized();
         config.evm_version = self.evm_version.unwrap_or_default();
+        info!("config.evm_version: {:?}", config.evm_version);
         let compute_units_per_second =
             if self.no_rate_limit { Some(u64::MAX) } else { self.compute_units_per_second };
 
         let tx_hash: TxHash = self.transaction.parse().wrap_err("invalid transaction hash")?;
+        
+        // Build TweakData with bytecode, ABI, and name
+        let tweak_info = TweakInfo {
+            bytecode: tweaked_code,
+            abi: tweaked_abi,
+            name: tweaked_name,
+        };
+        let tweak_data: TweakData = vec![(tweaked_addr, tweak_info)].into_iter().collect();
+        
         let r = self
             .replay_tx_hash(
                 &config,
                 &evm_opts,
                 tx_hash,
-                &vec![(tweaked_addr, tweaked_code)].into_iter().collect(),
+                &tweak_data,
                 compute_units_per_second,
             )
             .await?;
@@ -138,7 +150,7 @@ impl ReplayArgs {
         config: &Config,
         evm_opts: &EvmOpts,
         tx_hash: TxHash,
-        tweaks: &BTreeMap<Address, Bytes>,
+        tweaks: &TweakData,
         compute_units_per_second: Option<u64>,
     ) -> Result<ExecuteResult> {
         let quick = self.quick;
@@ -177,7 +189,9 @@ impl ReplayArgs {
         // build the executor
         let mut evm_opts = evm_opts.clone();
         evm_opts.fork_url = Some(config.get_rpc_url_or_localhost_http()?.into_owned());
+        info!("evm_opts.fork_url: {:?}", evm_opts.fork_url);
         evm_opts.fork_block_number = config.fork_block_number;
+        info!("evm_opts.fork_block_number: {:?}", evm_opts.fork_block_number);
         let env = evm_opts.evm_env().await?;
         let fork = evm_opts.get_fork(&config, env.clone());
         let backend = build_tweaked_backend(fork, tweaks)?;
@@ -292,6 +306,16 @@ fn execute_tx(
     {
         env.cfg.disable_base_fee = true;
     }
+
+    info!("print env details");
+    info!("print env.env.cfg.chain_id: {:?}", env.env.cfg.chain_id);
+    info!("print env.env.block.number: {:?}", env.env.block.number);
+    info!("print env.env.block.timestamp: {:?}", env.env.block.timestamp);
+    info!("print env.env.block.difficulty: {:?}", env.env.block.difficulty);
+    info!("print env.env.block.prevrandao: {:?}", env.env.block.prevrandao);
+    info!("print env.env.block.basefee: {:?}", env.env.block.basefee);
+    info!("print env.env.block.gas_limit: {:?}", env.env.block.gas_limit);
+    info!("print env.env.block.coinbase: {:?}", env.env.block.coinbase);
     if tx.to.is_some() {
         let r = executor.transact_with_env(env.clone()).wrap_err_with(|| {
             format!("Failed to execute transaction: {:?} in block {}", tx.hash, env.block.number)
@@ -331,7 +355,7 @@ mod tests {
         let args =
             super::ReplayArgs { quick: false, gas: None, gas_price: None, ..Default::default() };
         let r =
-            args.replay_tx_hash(&config, &evm_opts, tx, &BTreeMap::default(), None).await.unwrap();
+            args.replay_tx_hash(&config, &evm_opts, tx, &TweakData::default(), None).await.unwrap();
         let super::ExecuteResult::Call(result) = &r else {
             panic!("expected ExecuteResult::Call");
         };
@@ -357,12 +381,20 @@ mod tests {
         let args =
             super::ReplayArgs { quick: false, gas: None, gas_price: None, ..Default::default() };
 
+        // Create TweakData with minimal ABI for testing
+        let tweak_info = TweakInfo {
+            bytecode: tweaked_code,
+            abi: Default::default(), // Empty ABI for test
+            name: "TestContract".to_string(),
+        };
+        let tweak_data: TweakData = BTreeMap::from([(factory, tweak_info)]);
+
         let r = args
             .replay_tx_hash(
                 &config,
                 &evm_opts,
                 tx,
-                &BTreeMap::from([(factory, tweaked_code)]),
+                &tweak_data,
                 None,
             )
             .await

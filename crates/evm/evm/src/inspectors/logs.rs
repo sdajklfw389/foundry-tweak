@@ -44,10 +44,35 @@ impl<DB: Database> Inspector<DB> for LogCollector {
 
     fn call(
         &mut self,
-        _context: &mut EvmContext<DB>,
+        context: &mut EvmContext<DB>,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
+        // Log all calls to help debug
         if inputs.target_address == HARDHAT_CONSOLE_ADDRESS {
+            tracing::debug!(
+                "LogCollector: Received call to console address {:?} from caller {:?}",
+                inputs.target_address,
+                inputs.caller
+            );
+            // Log which contract is making the console.log call
+            let caller = inputs.caller;
+            let depth = context.journaled_state.depth;
+            let is_contract = context.journaled_state.state.get(&caller)
+                .map(|acc| acc.info.code_hash != revm::primitives::KECCAK_EMPTY)
+                .unwrap_or(false);
+            
+            let caller_type = if is_contract {
+                format!("contract at {:?}", caller)
+            } else {
+                format!("EOA {:?}", caller)
+            };
+            
+            tracing::debug!(
+                "LogCollector: Intercepting console.log call from {} (depth: {})",
+                caller_type,
+                depth
+            );
+            
             let (res, out) = self.hardhat_log(inputs.input.to_vec());
             if res != InstructionResult::Continue {
                 return Some(CallOutcome {

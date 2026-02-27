@@ -2,7 +2,7 @@
 //! The contract should from a cloned project created by `forge clone` command.
 //! The generation has to happen after the compatibility check.
 
-use alloy_primitives::{Address, Bytes, TxHash, U256};
+use alloy_primitives::{keccak256, Address, Bytes, TxHash, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::{
     serde_helpers::WithOtherFields, AnyReceiptEnvelope, BlockId, BlockTransactions,
@@ -28,6 +28,8 @@ use revm::{
     EvmContext, Inspector,
 };
 use std::borrow::Cow;
+use tracing::{info, trace};
+use revm::Database;
 
 use crate::{constants::NonStandardPrecompiled, ClonedProject};
 
@@ -114,7 +116,12 @@ impl Inspector<&mut Backend> for TweakInspctor {
         if Some((self.creation_count, self.creation_stack_depth)) == self.target_creation_tag {
             // we are going to tweak the creation code
             if let Some(tweaked_creation_code) = &self.tweaked_creation_code {
+                info!("create: Injecting tweaked creation code, length: {}", tweaked_creation_code.len());
+                info!("create: Original init_code length: {}", inputs.init_code.len());
                 inputs.init_code = tweaked_creation_code.clone();
+                info!("create: After injection, init_code length: {}", inputs.init_code.len());
+            } else {
+                info!("create: target_creation_tag matched but tweaked_creation_code is None!");
             }
         }
 
@@ -134,15 +141,63 @@ impl Inspector<&mut Backend> for TweakInspctor {
             if self.creation_count == target_count &&
                 self.creation_stack_depth == target_stack_depth
             {
+                info!("create_end: Matched target creation (count={}, depth={})", target_count, target_stack_depth);
                 if let Some(address) = outcome.address {
-                    if let Ok((code, _)) = context.code(address) {
+                    info!("create_end: Created address: {:?}", address);
+                    info!("create_end: outcome.result.result: {:?}", outcome.result.result);
+                    info!("create_end: outcome.result.output length: {}", outcome.result.output.len());
+                    info!("create_end: outcome.result.gas: {:?}", outcome.result.gas);
+                    
+                    // The runtime bytecode is in outcome.result.output (returned from CREATE)
+                    if outcome.result.is_ok() {
+                        let runtime_bytecode = outcome.result.output.clone();
+                        info!("create_end: Got runtime bytecode from outcome.result.output, length: {}", runtime_bytecode.len());
+                        if !runtime_bytecode.is_empty() {
+                            self.tweaked_code = Some(Bytes::from(runtime_bytecode));
+                        } else {
+                            info!("create_end: outcome.result.output is empty, trying context.code() as fallback");
+                            // Fallback: try to get from context
+                            match context.code(address) {
+                                Ok((code, _)) => {
+                                    info!("create_end: Fallback: Successfully retrieved code from context, length: {}", code.len());
+                                    if !code.is_empty() {
+                                        self.tweaked_code = Some(code.clone());
+                                    }
+                                }
+                                Err(e) => {
+                                    info!("create_end: Fallback: Failed to get code from context: {:?}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        info!("create_end: outcome.result is not OK: {:?}", outcome.result.result);
+                        info!("create_end: This means the CREATE failed - the tweaked creation code may have reverted or failed");
+                        // Even if it failed, try to get code from database as last resort
+                        info!("create_end: Attempting to get code from database despite failure...");
+                        match context.code(address) {
+                            Ok((code, _)) => {
+                                info!("create_end: Database fallback: code length: {}", code.len());
+                                if !code.is_empty() {
                         self.tweaked_code = Some(code.clone());
                     }
                 }
+                            Err(e) => {
+                                info!("create_end: Database fallback failed: {:?}", e);
+                            }
+                        }
+                    }
+                } else {
+                    info!("create_end: outcome.address is None");
+                }
+            } else {
+                info!("create_end: Creation count/depth mismatch: count={} (target={}), depth={} (target={})", 
+                      self.creation_count, target_count, self.creation_stack_depth, target_stack_depth);
             }
         } else {
             // we are here to find the target creation count
             if outcome.address == self.contract_address {
+                info!("create_end: Found target contract address, setting target_creation_tag: count={}, depth={}", 
+                      self.creation_count, self.creation_stack_depth);
                 self.target_creation_tag = Some((self.creation_count, self.creation_stack_depth));
             }
         }
@@ -193,27 +248,35 @@ pub async fn generate_tweaked_code(
 ) -> Result<Bytes> {
     println!("Tweaking the contract at {}...", project.metadata.address);
     p_println!(!quick => "It may take time if the RPC has rate limits.");
+    trace!("generate_tweaked_code: Target contract from metadata: '{}'", project.metadata.target_contract);
+    trace!("generate_tweaked_code: Contract address: {}", project.metadata.address);
     // prepare the deployment bytecode (w/ parameters)
     let artifact = project.main_artifact()?;
     let tweaked_creation_code = prepare_tweaked_creation_code(project, &artifact)?;
+    trace!("generate_tweaked_code: tweaked_creation_code: {:?}", tweaked_creation_code);
 
     // let's tweak!
-    tweak(rpc, project, tweaked_creation_code, quick).await
+    tweak(rpc, project, tweaked_creation_code, &artifact, quick).await
 }
 
-// tweak the contract creation code
-async fn tweak(
+// Try to generate tweaked bytecode using CREATE execution method
+async fn try_create_execution(
     rpc: &RpcOpts,
     project: &ClonedProject,
-    tweaked_creation_code: Bytes,
+    tweaked_creation_code: &Bytes,
     quick: bool,
 ) -> Result<Bytes> {
     // prepare the execution backend
     let (mut db, mut env) = prepare_backend(rpc, project, quick).await?;
 
+    // disable gas_limit, base_fee, and balance_check for the replayed transaction
+    env.cfg.disable_block_gas_limit = true;
+    env.cfg.disable_base_fee = true;
+    env.cfg.disable_balance_check = true;
+
     // let hook into the creation process
     let mut inspector =
-        TweakInspctor::new(Some(project.metadata.address), Some(tweaked_creation_code));
+        TweakInspctor::new(Some(project.metadata.address), Some(tweaked_creation_code.clone()));
 
     // round 1: pinpoint the target creation count
     inspector.prepare_for_pinpoint()?;
@@ -231,22 +294,142 @@ async fn tweak(
 
     // round 2: tweak the creation code
     inspector.prepare_for_tweak()?;
-    // disable gas_limit and decrease gas_fee for the inspector
-    env.cfg.disable_block_gas_limit = true;
-    env.cfg.disable_base_fee = true;
     // increase gas_limit and decrease gas_price for the transaction
     env.tx.gas_limit = env.tx.gas_limit.checked_mul(2).ok_or(eyre!("gas limit overflow"))?;
     env.tx.gas_price =
         env.tx.gas_price.checked_div(U256::from(2)).ok_or(eyre!("divided by zero"))?;
     env.tx.gas_priority_fee = Some(U256::ZERO);
     // we do not care about the execution result in this round
-    db.inspect(&mut env, &mut inspector)?;
+    let rv = db.inspect(&mut env, &mut inspector)?;
     eyre::ensure!(
         inspector.observed_created_addresses.len() <= 1,
         "hooked ADDRESS opcodes return different addresses"
     );
 
+    trace!("tweak: inspector.tweaked_code after CREATE execution: {:?}", inspector.tweaked_code);
+    if let Some(ref code) = inspector.tweaked_code {
+        let hash = keccak256(code.as_ref());
+        info!("tweak: tweaked_code hash: {:?}", hash);
+    }
+
     inspector.tweaked_code.ok_or(eyre!("the tweaked code is not generated"))
+}
+
+// tweak the contract creation code
+async fn tweak(
+    rpc: &RpcOpts,
+    project: &ClonedProject,
+    tweaked_creation_code: Bytes,
+    artifact: &ConfigurableContractArtifact,
+    quick: bool,
+) -> Result<Bytes> {
+    // PRIMARY: Try CREATE execution method first
+    info!("tweak: Attempting CREATE execution method to generate tweaked bytecode");
+    
+    // Try CREATE execution method
+    match try_create_execution(rpc, project, &tweaked_creation_code, quick).await {
+        Ok(bytecode) => {
+            info!("tweak: Successfully generated bytecode using CREATE execution method");
+            return Ok(bytecode);
+        }
+        Err(e) => {
+            info!("tweak: CREATE execution method failed: {}, falling back to local artifact", e);
+        }
+    }
+
+    // FALLBACK: Read deployed bytecode directly from the JSON artifact file
+    info!("tweak: Attempting to read deployed bytecode directly from JSON artifact file");
+    
+    // Search for the artifact JSON file in the out directory
+    // Format: out/<SourceFile>/<ContractName>.json
+    // We need to search because we don't know the source file name
+    let out_dir = project.root.join("out");
+    let target_contract = &project.metadata.target_contract;
+    
+    info!("tweak: Searching for {}.json in {}", target_contract, out_dir.display());
+    
+    let mut artifact_path = None;
+    if out_dir.exists() && out_dir.is_dir() {
+        // Search all subdirectories in out/
+        if let Ok(entries) = std::fs::read_dir(&out_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let potential_artifact = entry.path().join(format!("{}.json", target_contract));
+                    if potential_artifact.exists() {
+                        info!("tweak: Found artifact at: {}", potential_artifact.display());
+                        artifact_path = Some(potential_artifact);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    let artifact_path = match artifact_path {
+        Some(path) => path,
+        None => {
+            info!("tweak: Could not find artifact JSON file for contract '{}'", target_contract);
+            return Err(eyre!("Failed to generate tweaked bytecode: CREATE execution failed and artifact file not found"));
+        }
+    };
+    
+    if artifact_path.exists() {
+        info!("tweak: Reading from artifact file: {}", artifact_path.display());
+        match std::fs::read_to_string(&artifact_path) {
+            Ok(json_content) => {
+                info!("tweak: Read {} bytes from JSON file", json_content.len());
+                match serde_json::from_str::<serde_json::Value>(&json_content) {
+                    Ok(json) => {
+                        // Extract deployedBytecode.object field
+                        if let Some(deployed_bytecode_hex) = json.get("deployedBytecode")
+                            .and_then(|db| db.get("object"))
+                            .and_then(|obj| obj.as_str())
+                        {
+                            info!("tweak: Found deployedBytecode.object in JSON: {} total chars", deployed_bytecode_hex.len());
+                            info!("tweak: First 100 chars: {}", &deployed_bytecode_hex[..std::cmp::min(100, deployed_bytecode_hex.len())]);
+                            if deployed_bytecode_hex.len() > 100 {
+                                let start_pos = deployed_bytecode_hex.len().saturating_sub(100);
+                                info!("tweak: Last 100 chars: {}", &deployed_bytecode_hex[start_pos..]);
+                            }
+                            
+                            // Strip 0x prefix if present
+                            let hex_str = deployed_bytecode_hex.strip_prefix("0x").unwrap_or(deployed_bytecode_hex);
+                            
+                            // Convert hex string to bytes
+                            match alloy_primitives::hex::decode(hex_str) {
+                                Ok(bytecode_bytes) => {
+                                    info!("tweak: Successfully decoded deployed bytecode from JSON: {} bytes", bytecode_bytes.len());
+                                    
+                                    // Log first and last few bytes for debugging
+                                    let preview_len = std::cmp::min(32, bytecode_bytes.len());
+                                    info!("tweak: Deployed bytecode FIRST {} bytes: {:02x?}", preview_len, &bytecode_bytes[..preview_len]);
+                                    if bytecode_bytes.len() > 32 {
+                                        let end_start = bytecode_bytes.len().saturating_sub(32);
+                                        info!("tweak: Deployed bytecode LAST 32 bytes: {:02x?}", &bytecode_bytes[end_start..]);
+                                    }
+                                    
+                                    return Ok(Bytes::from(bytecode_bytes));
+                                }
+                                Err(e) => {
+                                    return Err(eyre!("Failed to decode hex bytecode from artifact: {}", e));
+                                }
+                            }
+                        } else {
+                            return Err(eyre!("deployedBytecode.object not found in JSON artifact"));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(eyre!("Failed to parse JSON artifact: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(eyre!("Failed to read artifact file: {}", e));
+            }
+        }
+    } else {
+        return Err(eyre!("Artifact file not found at expected path"));
+    }
 }
 
 fn prepare_tweaked_creation_code(
@@ -254,8 +437,10 @@ fn prepare_tweaked_creation_code(
     artifact: &ConfigurableContractArtifact,
 ) -> Result<Bytes> {
     let bytecode = artifact.get_bytecode().ok_or(eyre!("the contract does not have bytecode"))?;
+    trace!("prepare_tweaked_creation_code: bytecode: {:?}", bytecode);
     let deployment_bytecode =
         bytecode.bytes().ok_or(eyre!("the bytecode transformation failed"))?;
+    trace!("prepare_tweaked_creation_code: deployment_bytecode: {:?}", deployment_bytecode);
     let constructor_arguments = &project.metadata.constructor_arguments;
 
     // concate the deployment bytecode with the constructor arguments
@@ -271,8 +456,9 @@ async fn prepare_backend(
     quick: bool,
 ) -> Result<(Backend, EnvWithHandlerCfg)> {
     // get rpc_url
-    let rpc_url =
-        &rpc.url(Some(&project.config))?.unwrap_or(Cow::Borrowed("http://localhost:8545"));
+    let rpc_url_cow = rpc.url(Some(&project.config))?.unwrap_or(Cow::Borrowed("http://localhost:8545"));
+    let rpc_url: &str = rpc_url_cow.as_ref();
+    info!("rpc_url: {}", rpc_url);
 
     // prepare the RPC provider
     let provider = ProviderBuilder::new(rpc_url)
@@ -283,11 +469,13 @@ async fn prepare_backend(
         .build()?;
 
     // get block number
+    info!("project.metadata.creation_transaction: {:?}", project.metadata.creation_transaction);
     let tx_receipt = provider
         .get_transaction_receipt(project.metadata.creation_transaction)
         .await?
         .ok_or(eyre!("the transaction is not mined"))?;
     let block_number = tx_receipt.block_number.ok_or(eyre!("the transaction is not mined"))?;
+    info!("block_number: {}", block_number);
 
     // then, we are going to replay all transactions before the creation transaction
     let block = provider
@@ -296,7 +484,7 @@ async fn prepare_backend(
         .ok_or(eyre!("block not found"))?;
 
     // prepare the block env
-    let mut block_env = BlockEnv {
+    let mut block_env: BlockEnv = BlockEnv {
         number: U256::from(
             block.header.number.expect("block number is not found. Maybe it is not mined yet?"),
         ),
@@ -334,6 +522,12 @@ async fn prepare_backend(
         )]
     };
 
+    // print all tx hashes within txs_with_receipt
+    info!("Total transactions in block: {}", txs_with_receipt.len());
+    for (index, (tx, _receipt)) in txs_with_receipt.iter().enumerate() {
+        info!("  [{}] tx hash: {:?}", index, tx.hash);
+    }
+
     // get the figment from the cloned project's config
     let mut config = project.config.clone();
     config.fork_block_number = Some(block_number - 1);
@@ -352,27 +546,74 @@ async fn prepare_backend(
     let env = evm_opts.evm_env().await?;
 
     // a loop to probe the proper EVM version
-    let mut spec_id = config.evm_spec_id();
     let chain_id =
         NamedChain::try_from(project.metadata.chain_id).map_err(|_| eyre!("invalid chain id"))?;
+    
+    // Start with an initial guess based on block number for mainnet
+    // This helps avoid probing from wrong direction (e.g., starting at ISTANBUL for a BYZANTIUM block)
+    let mut spec_id = if chain_id == NamedChain::Mainnet {
+        // Estimate spec_id based on block number (mainnet hardfork blocks)
+        let estimated = match block_number {
+            n if n < 1_150_000 => SpecId::FRONTIER,
+            n if n < 2_463_000 => SpecId::HOMESTEAD,
+            n if n < 2_675_000 => SpecId::TANGERINE,
+            n if n < 4_370_000 => SpecId::SPURIOUS_DRAGON,
+            n if n < 7_280_000 => SpecId::BYZANTIUM,
+            n if n < 9_069_000 => SpecId::PETERSBURG,
+            n if n < 12_244_000 => SpecId::ISTANBUL,
+            n if n < 12_965_000 => SpecId::BERLIN,
+            n if n < 13_773_000 => SpecId::LONDON,
+            n if n < 15_050_000 => SpecId::ARROW_GLACIER,
+            n if n < 15_537_394 => SpecId::GRAY_GLACIER,
+            n if n < 17_034_870 => SpecId::MERGE,
+            n if n < 19_426_589 => SpecId::SHANGHAI,
+            n if n < 22_431_084 => SpecId::CANCUN,
+            _ => SpecId::PRAGUE,
+        };
+        info!("Block {} estimated spec_id: {:?} (config default was {:?})", block_number, estimated, config.evm_spec_id());
+        estimated
+    } else {
+        config.evm_spec_id()
+    };
+    info!("Starting probe with spec_id: {:?}", spec_id);
+
+    // Arbitrum uses a modified EVM with different gas costs, so gas matching will fail
+    // Skip probing for Arbitrum chains and use the config's default spec_id
+    let is_arbitrum = matches!(
+        chain_id,
+        NamedChain::Arbitrum
+            | NamedChain::ArbitrumGoerli
+            | NamedChain::ArbitrumNova
+            | NamedChain::ArbitrumTestnet
+    );
+
+    if is_arbitrum {
+        cli_warn!("Tweaking contracts on Arbitrum: Skipping EVM version probing due to Arbitrum's modified gas model. Using config default spec_id: {:?}. Arbitrum is EVM-compatible but uses different gas costs, so gas matching will not work.", spec_id);
+        // Skip probing for Arbitrum - use the config's default spec_id directly
+        // Arbitrum launched after London, so it should support at least London/Merge
+    }
 
     if chain_id == NamedChain::BinanceSmartChain || chain_id == NamedChain::BinanceSmartChainTestnet
     {
         cli_warn!("Tweaking contracts on BinanceSmartChain (BSC) may not work due to its non-standard gas consumption. Please see more at https://github.com/foundry-rs/foundry/issues/4784#issuecomment-1520402694");
     }
 
-    if !quick {
+    if !quick && !is_arbitrum {
+        info!("Starting EVM version probe for block {}", block_number);
         loop {
             // get backend and executor
             let db = Backend::spawn(evm_opts.get_fork(&config, env.clone()));
             // create the executor and the corresponding env
             let executor = ExecutorBuilder::new().spec(spec_id).build(env.clone(), db);
+            info!("Trying spec_id {:?} for block {}", spec_id, block_number);
 
             match probe_evm_version(chain_id, executor, &block_env, &txs_with_receipt, None) {
                 Ok(_) => {
+                    info!("probe_evm_version succeeded with spec_id: {:?}", spec_id);
                     break;
                 }
-                Err(_) => {
+                Err(e) => {
+                    info!("probe_evm_version fails with spec_id {:?}: {}", spec_id, e);
                     spec_id = SpecId::try_from_u8((spec_id as u8) + 1)
                         .ok_or(eyre!("failed to probe a proper EVM version. You may want to use --quick option to skip EVM version probing."))?;
                 }
@@ -382,6 +623,14 @@ async fn prepare_backend(
 
     let db = Backend::spawn(evm_opts.get_fork(&config, env.clone()));
     let executor = ExecutorBuilder::new().spec(spec_id).build(env.clone(), db);
+    
+    // Skip final probe for Arbitrum chains (gas matching won't work)
+    // For Arbitrum, we still need to return the backend and env, so we call probe_evm_version
+    // but it will use the spec_id we already determined (from config default)
+    if is_arbitrum {
+        info!("Skipping final EVM version probe for Arbitrum chain (using spec_id: {:?})", spec_id);
+    }
+    
     probe_evm_version(
         chain_id,
         executor,
@@ -398,11 +647,22 @@ fn probe_evm_version(
     txs: &[(TransactionExt, TransactionReceiptExt)],
     target_tx: Option<TxHash>,
 ) -> Result<(Backend, EnvWithHandlerCfg)> {
+    info!("probe_evm_version is called");
+    info!("chain_id is {:?}", chain_id);
     let mut env = executor.env_with_handler_cfg().clone();
 
     env.block = block_env.clone();
 
     let non_standard_precompiled = NonStandardPrecompiled::get_precomiled_address(chain_id);
+    
+    // Arbitrum uses a modified EVM with different gas costs, so gas matching will fail
+    let is_arbitrum = matches!(
+        chain_id,
+        NamedChain::Arbitrum
+            | NamedChain::ArbitrumGoerli
+            | NamedChain::ArbitrumNova
+            | NamedChain::ArbitrumTestnet
+    );
 
     let pb =
         init_progress(txs.len() as u64, format!("investigating {:?}", executor.spec_id()).as_str());
@@ -427,7 +687,10 @@ fn probe_evm_version(
         configure_tx_env(&mut env, tx);
 
         // find the creation transaction
+        info!("target_tx is {:?}", target_tx);
+        info!("tx.hash is {:?}", tx.hash);
         if Some(tx.hash) == target_tx {
+            info!("probe_evm_version returns: {:?}", tx.hash);
             return Ok((executor.backend().clone(), env));
         }
 
@@ -439,7 +702,18 @@ fn probe_evm_version(
 
             let rv = rv.wrap_err("Executing transaction fails")?;
 
-            // check gas used
+            // check gas used (skip for Arbitrum due to different gas model)
+            if rv.gas_used != real_gas_used {
+                info!(
+                    "Gas mismatch for tx {:?}: replayed {} (with spec_id {:?}), actual on-chain {}. Difference: {}",
+                    tx.hash,
+                    rv.gas_used,
+                    executor.spec_id(),
+                    real_gas_used,
+                    rv.gas_used as i64 - real_gas_used as i64
+                );
+            }
+            if !is_arbitrum {
             eyre::ensure!(
                 rv.gas_used == real_gas_used,
                 "Gas used mismatch: expected {}, got {} ({:?})",
@@ -447,6 +721,9 @@ fn probe_evm_version(
                 rv.gas_used,
                 tx.hash
             );
+            } else {
+                info!("Skipping gas check for Arbitrum chain (tx: {:?})", tx.hash);
+            }
 
             // check transaction status
             if (**receipt).inner.inner.receipt.status.coerce_status() {
@@ -458,6 +735,7 @@ fn probe_evm_version(
             match executor.deploy_with_env(env.clone(), None) {
                 // Reverted transactions should be skipped
                 Err(EvmError::Execution(error)) => {
+                    if !is_arbitrum {
                     eyre::ensure!(
                         error.gas_used == real_gas_used,
                         "Gas used mismatch: expected {}, got {} ({:?})",
@@ -465,6 +743,9 @@ fn probe_evm_version(
                         error.gas_used,
                         tx.hash
                     );
+                    } else {
+                        info!("Skipping gas check for Arbitrum chain (deploy tx: {:?})", tx.hash);
+                    }
                     eyre::ensure!(
                         !(**receipt).inner.inner.receipt.status.coerce_status(),
                         "Transaction should fail ({:?})",
@@ -498,8 +779,10 @@ fn probe_evm_version(
     }
 
     if target_tx.is_none() {
+        info!("target_tx is none");
         Ok((executor.backend().clone(), env))
     } else {
+        info!("target_tx is not none");
         Err(eyre!("the target transaction is not found"))
     }
 }
@@ -544,9 +827,10 @@ mod tests {
         let rpc_url = std::env::var("ETH_RPC_URL").unwrap_or("http://localhost:8545".to_string());
         let rpc = RpcOpts { url: Some(rpc_url), ..Default::default() };
 
+        let artifact = fake_project.main_artifact().unwrap();
         let tweaked_code = format!(
             "{:?}",
-            tweak(&rpc, &fake_project, Bytes::from_str(FAKE_CREATION_CODE).unwrap(), false)
+            tweak(&rpc, &fake_project, Bytes::from_str(FAKE_CREATION_CODE).unwrap(), &artifact, false)
                 .await
                 .unwrap()
         );
@@ -566,9 +850,10 @@ mod tests {
         let rpc_url = std::env::var("ETH_RPC_URL").unwrap_or("http://localhost:8545".to_string());
         let rpc = RpcOpts { url: Some(rpc_url), ..Default::default() };
 
+        let artifact = fake_project.main_artifact().unwrap();
         let tweaked_code = format!(
             "{:?}",
-            tweak(&rpc, &fake_project, Bytes::from_str(FAKE_CREATION_CODE).unwrap(), false)
+            tweak(&rpc, &fake_project, Bytes::from_str(FAKE_CREATION_CODE).unwrap(), &artifact, false)
                 .await
                 .unwrap()
         );

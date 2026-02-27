@@ -24,6 +24,7 @@ use foundry_compilers::{
 use foundry_evm::constants::DEFAULT_CREATE2_DEPLOYER;
 use foundry_linking::Linker;
 use std::{path::PathBuf, str::FromStr, sync::Arc};
+use tracing::info;
 
 /// Container for the compiled contracts.
 #[derive(Debug)]
@@ -166,24 +167,36 @@ impl PreprocessedState {
     /// After compilation, finds exact [ArtifactId] of the target contract.
     pub fn compile(self) -> Result<CompiledState> {
         let Self { args, script_config, script_wallets } = self;
-        let project = script_config.config.project()?;
+        info!("compile(): Getting project from config");
+        let project = script_config.config.project()
+            .map_err(|e| eyre::eyre!("Failed to get project from config: {}", e))?;
 
         let mut target_name = args.target_contract.clone();
 
+        info!("compile(): Resolving target path for: {}", args.path);
         // If we've received correct path, use it as target_path
         // Otherwise, parse input as <path>:<name> and use the path from the contract info, if
         // present.
         let target_path = if let Ok(path) = dunce::canonicalize(&args.path) {
+            info!("compile(): Successfully canonicalized path: {:?}", path);
             path
         } else {
-            let contract = ContractInfo::from_str(&args.path)?;
+            info!("compile(): Path canonicalization failed, trying ContractInfo parsing");
+            let contract = ContractInfo::from_str(&args.path)
+                .map_err(|e| eyre::eyre!("Failed to parse contract info from '{}': {}", args.path, e))?;
             target_name = Some(contract.name.clone());
             if let Some(path) = contract.path {
-                dunce::canonicalize(path)?
+                info!("compile(): Trying to canonicalize contract path: {:?}", path);
+                let path_clone = path.clone();
+                dunce::canonicalize(&path)
+                    .map_err(|e| eyre::eyre!("Failed to canonicalize contract path {:?}: {}", path_clone, e))?
             } else {
-                project.find_contract_path(contract.name.as_str())?
+                info!("compile(): Finding contract path for name: {}", contract.name);
+                project.find_contract_path(contract.name.as_str())
+                    .map_err(|e| eyre::eyre!("Failed to find contract path for '{}': {}", contract.name, e))?
             }
         };
+        info!("compile(): Target path resolved: {:?}", target_path);
 
         #[allow(clippy::redundant_clone)]
         let sources_to_compile = source_files_iter(

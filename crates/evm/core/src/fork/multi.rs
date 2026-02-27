@@ -118,7 +118,7 @@ impl MultiFork {
     ///
     /// If no matching fork backend exists it will be created
     pub fn create_fork(&self, fork: CreateFork) -> eyre::Result<(ForkId, SharedBackend, Env)> {
-        trace!("Creating new fork, url={}, block={:?}", fork.url, fork.evm_opts.fork_block_number);
+        info!("Creating new fork, url={}, block={:?}", fork.url, fork.evm_opts.fork_block_number);
         let (sender, rx) = oneshot_channel();
         let req = Request::CreateFork(Box::new(fork), sender);
         self.handler.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;

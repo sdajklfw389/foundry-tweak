@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use alloy_json_abi::JsonAbi;
 use alloy_primitives::{Address, Bytes, ChainId, TxHash};
 use eyre::{eyre, Result};
 use foundry_cli::opts::RpcOpts;
@@ -11,9 +12,10 @@ use foundry_compilers::{
     artifacts::{
         output_selection::ContractOutputSelection, ConfigurableContractArtifact, StorageLayout,
     },
-    ProjectCompileOutput,
+    Artifact, ProjectCompileOutput,
 };
 use foundry_config::Config;
+use tracing::{info, debug};
 
 /// ClonedProject represents a foundry project that is cloned by the `forge clone` command.
 /// It couples with an on-chain contract instance.
@@ -119,12 +121,55 @@ impl ClonedProject {
         }
 
         let output = self.compile_safe()?;
-        let (_, _, artifact) = output
+        
+        // Log all available contracts for debugging
+        let available_contracts: Vec<_> = output
+            .artifacts_with_files()
+            .map(|(path, contract_name, _)| (path.to_string_lossy().to_string(), contract_name.to_string()))
+            .collect();
+        info!("main_artifact: Looking for contract '{}' in metadata", self.metadata.target_contract);
+        info!("main_artifact: Available contracts: {:?}", available_contracts);
+        
+        let (path, contract_name, artifact) = output
             .artifacts_with_files()
             .find(|(_, contract_name, _)| **contract_name == self.metadata.target_contract)
             .ok_or_else(|| {
-                eyre!("the contract {} is not found in the project", self.metadata.target_contract)
+                eyre!("the contract {} is not found in the project. Available contracts: {:?}", 
+                    self.metadata.target_contract, 
+                    available_contracts.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>())
             })?;
+
+        info!("main_artifact: Selected contract '{}' from path '{}'", contract_name, path.to_string_lossy());
+        
+        // Verify the selected contract matches the target
+        if contract_name.as_str() != self.metadata.target_contract {
+            return Err(eyre!(
+                "Contract name mismatch: expected '{}' but found '{}'",
+                self.metadata.target_contract,
+                contract_name
+            ));
+        }
+        
+        // Check for other contracts in the same file that also have bytecode (potential confusion)
+        let other_contracts_in_file: Vec<_> = output
+            .artifacts_with_files()
+            .filter(|(p, name, _)| {
+                p == &path && name.as_str() != self.metadata.target_contract
+            })
+            .map(|(_, name, art)| (name.to_string(), art.get_bytecode().is_some()))
+            .collect();
+        
+        if !other_contracts_in_file.is_empty() {
+            info!("main_artifact: Warning: Found {} other contract(s) in the same file: {:?}", 
+                other_contracts_in_file.len(), 
+                other_contracts_in_file.iter().map(|(name, has_bytecode)| {
+                    format!("{} (bytecode: {})", name, has_bytecode)
+                }).collect::<Vec<_>>()
+            );
+        }
+        
+        info!("main_artifact: Contract has bytecode: {}", artifact.get_bytecode().is_some());
+        info!("main_artifact: Contract has deployed bytecode: {}", artifact.get_deployed_bytecode_object().is_some());
 
         // cache the artifact
         Self::set_cache(self._main_artifact.clone(), artifact.clone());
@@ -146,7 +191,16 @@ impl ClonedProject {
 
         // get tweaked code
         let code = super::code::generate_tweaked_code(rpc, self, quick).await?;
+        debug!("tweaked_code: tweaked bytecode: {:?}", code);
         Ok(code)
+    }
+
+    /// Get the ABI of the main contract of the project.
+    pub fn get_abi(&self) -> Result<JsonAbi> {
+        let artifact = self.main_artifact()?;
+        let abi = artifact.abi.ok_or_else(|| eyre!("No ABI found in artifact for contract {}", self.metadata.target_contract))?;
+        info!("get_abi: Loaded ABI for {} with {} items", self.metadata.target_contract, abi.len());
+        Ok(abi)
     }
 }
 

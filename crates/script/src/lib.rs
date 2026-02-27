@@ -17,7 +17,7 @@ use broadcast::next_nonce;
 use build::PreprocessedState;
 use clap::{Parser, ValueHint};
 use dialoguer::Confirm;
-use eyre::{ContextCompat, Result};
+use eyre::{ContextCompat, Result, eyre};
 use forge_verify::RetryArgs;
 use foundry_cli::{opts::CoreBuildArgs, utils::LoadConfig};
 use foundry_common::{
@@ -26,6 +26,7 @@ use foundry_common::{
     shell, ContractsByArtifact, CONTRACT_MAX_SIZE, SELECTOR_LEN,
 };
 use foundry_compilers::ArtifactId;
+use foundry_compilers::artifacts::EvmVersion;
 use foundry_config::{
     figment,
     figment::{
@@ -43,9 +44,11 @@ use foundry_evm::{
         CheatsConfig,
     },
     opts::EvmOpts,
+    revm::Database,
     traces::Traces,
 };
 use foundry_wallets::MultiWalletOpts;
+use foundry_cli::opts::RpcOpts;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 use yansi::Paint;
@@ -220,13 +223,18 @@ impl ScriptArgs {
         let script_wallets =
             ScriptWallets::new(self.wallets.get_multi_wallet().await?, self.evm_opts.sender);
 
-        let (config, mut evm_opts) = self.load_config_and_evm_opts_emit_warnings()?;
+        let (mut config, mut evm_opts) = self.load_config_and_evm_opts_emit_warnings()?;
+
+        if evm_opts.env.chain_id == Some(42161) {
+            config.evm_version = EvmVersion::Cancun;
+            info!("preprocess: forced evm_version to Cancun for Arbitrum");
+        }
 
         if let Some(sender) = self.maybe_load_private_key()? {
             evm_opts.sender = sender;
         }
 
-        let script_config = ScriptConfig::new(config, evm_opts).await?;
+        let script_config: ScriptConfig = ScriptConfig::new(config, evm_opts).await?;
 
         Ok(PreprocessedState { args: self, script_config, script_wallets })
     }
@@ -236,23 +244,63 @@ impl ScriptArgs {
         trace!(target: "script", "executing script command");
 
         let compiled = self.preprocess().await?.compile()?;
+        info!("compile() completed successfully");
 
         // Move from `CompiledState` to `BundledState` either by resuming or executing and
         // simulating script.
+        info!("Checking resume/verify flags: resume={}, verify={}, broadcast={}", 
+              compiled.args.resume, compiled.args.verify, compiled.args.broadcast);
         let bundled = if compiled.args.resume || (compiled.args.verify && !compiled.args.broadcast)
         {
+            info!("Taking resume path");
             compiled.resume().await?
         } else {
+            info!("Taking execute path");
             // Drive state machine to point at which we have everything needed for simulation.
-            let pre_simulation = compiled
-                .link()
-                .await?
-                .prepare_execution()
-                .await?
-                .execute()
-                .await?
-                .prepare_simulation()
-                .await?;
+            info!("Starting link()");
+            let linked = match compiled.link().await {
+                Ok(l) => {
+                    info!("link() completed successfully");
+                    l
+                }
+                Err(e) => {
+                    eprintln!("ERROR in link(): {}", e);
+                    return Err(e);
+                }
+            };
+            info!("Starting prepare_execution()");
+            let pre_exec = match linked.prepare_execution().await {
+                Ok(p) => {
+                    info!("prepare_execution() completed successfully");
+                    p
+                }
+                Err(e) => {
+                    eprintln!("ERROR in prepare_execution(): {}", e);
+                    return Err(e);
+                }
+            };
+            info!("Starting execute()");
+            let executed = match pre_exec.execute().await {
+                Ok(e) => {
+                    info!("execute() completed successfully");
+                    e
+                }
+                Err(e) => {
+                    eprintln!("ERROR in execute(): {}", e);
+                    return Err(e);
+                }
+            };
+            info!("Starting prepare_simulation()");
+            let pre_simulation = match executed.prepare_simulation().await {
+                Ok(p) => {
+                    info!("prepare_simulation() completed successfully");
+                    p
+                }
+                Err(e) => {
+                    eprintln!("ERROR in prepare_simulation(): {}", e);
+                    return Err(e);
+                }
+            };
 
             if pre_simulation.args.debug {
                 return pre_simulation.run_debugger()
@@ -555,7 +603,7 @@ impl ScriptConfig {
     }
 
     async fn get_runner(&mut self) -> Result<ScriptRunner> {
-        self._get_runner(None, false).await
+        self._get_runner(None, false, None).await
     }
 
     async fn get_runner_with_cheatcodes(
@@ -564,36 +612,57 @@ impl ScriptConfig {
         script_wallets: ScriptWallets,
         debug: bool,
         target: ArtifactId,
+        tweak_data: Option<&foundry_tweak::TweakData>,
     ) -> Result<ScriptRunner> {
-        self._get_runner(Some((known_contracts, script_wallets, target)), debug).await
+        self._get_runner(Some((known_contracts, script_wallets, target)), debug, tweak_data).await
     }
 
     async fn _get_runner(
         &mut self,
         cheats_data: Option<(ContractsByArtifact, ScriptWallets, ArtifactId)>,
         debug: bool,
+        tweak_data: Option<&foundry_tweak::TweakData>,
     ) -> Result<ScriptRunner> {
         trace!("preparing script runner");
         let env = self.evm_opts.evm_env().await?;
 
-        let db = if let Some(fork_url) = self.evm_opts.fork_url.as_ref() {
-            match self.backends.get(fork_url) {
+        let mut db = if let Some(fork_url) = self.evm_opts.fork_url.as_ref() {
+            info!("at line 623");
+            let mut backend = match self.backends.get(fork_url) {
                 Some(db) => db.clone(),
                 None => {
                     let fork = self.evm_opts.get_fork(&self.config, env.clone());
                     let backend = Backend::spawn(fork);
-                    self.backends.insert(fork_url.clone(), backend.clone());
                     backend
                 }
+            };
+
+            // Apply tweak to backend BEFORE creating executor (like forge replay does)
+            if let Some(tweaks) = tweak_data {
+                foundry_tweak::tweak_backend(&mut backend, tweaks)?;
+                info!("_get_runner: Applied tweak to backend before creating executor");
             }
+
+            // Cache (or refresh) the tweaked backend for this fork URL
+            self.backends.insert(fork_url.clone(), backend.clone());
+            backend
         } else {
+            info!("at line 643");
             // It's only really `None`, when we don't pass any `--fork-url`. And if so, there is
             // no need to cache it, since there won't be any onchain simulation that we'd need
             // to cache the backend for.
-            Backend::spawn(None)
+            let mut backend = Backend::spawn(None);
+            if let Some(tweaks) = tweak_data {
+                foundry_tweak::tweak_backend(&mut backend, tweaks)?;
+                info!("_get_runner: Applied tweak to backend before creating executor");
+            }
+            backend
         };
 
+        info!("at line 656: self.config.evm_spec_id(): {:?}", self.config.evm_spec_id());
         // We need to enable tracing to decode contract names: local or external.
+        // Log collection is enabled by default, but we explicitly enable it to be sure
+        // Note: forge replay only uses .trace(true) and logs work there, so logs should work here too
         let mut builder = ExecutorBuilder::new()
             .inspectors(|stack| stack.trace(true))
             .spec(self.config.evm_spec_id())
@@ -618,7 +687,32 @@ impl ScriptConfig {
             });
         }
 
-        Ok(ScriptRunner::new(builder.build(env, db), self.evm_opts.clone()))
+        // Check if the db has the tweaked bytecode
+        if let Some(tweaks) = tweak_data {
+            for (addr, info) in tweaks {
+                match db.basic(*addr)? {
+                    Some(account) => {
+                        let code_len = account.code.as_ref().map(|code| code.len()).unwrap_or(0);
+                        info!(
+                            "_get_runner: Tweaked addr {:?} ({}) code_len {} expected {} code_hash {:?}",
+                            addr,
+                            info.name,
+                            code_len,
+                            info.bytecode.len(),
+                            account.code_hash
+                        );
+                    }
+                    None => {
+                        warn!(
+                            "_get_runner: No account info for tweaked addr {:?} ({})",
+                            addr, info.name
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(ScriptRunner::new(builder.build(env, db.clone()), self.evm_opts.clone()))
     }
 }
 

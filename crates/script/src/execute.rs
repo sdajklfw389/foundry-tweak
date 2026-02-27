@@ -26,6 +26,7 @@ use foundry_debugger::Debugger;
 use foundry_evm::{
     decode::decode_console_logs,
     inspectors::cheatcodes::BroadcastableTransactions,
+    revm::Database,
     traces::{
         decode_trace_arena,
         identifier::{SignaturesIdentifier, TraceIdentifiers},
@@ -36,6 +37,7 @@ use foundry_tweak::{build_tweak_data, tweak_backend, TweakData};
 use futures::future::join_all;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
+use tracing::{info, warn};
 use yansi::Paint;
 
 /// State after linking, contains the linked build data along with library addresses and optional
@@ -66,11 +68,25 @@ impl LinkedState {
     pub async fn prepare_execution(self) -> Result<PreExecutionState> {
         let Self { args, script_config, script_wallets, build_data } = self;
 
+        // Please print the script_config details: such as script_config.evm_opts.env.
+        info!("script_config.evm_opts.env.chain_id: {:?}", script_config.evm_opts.env.chain_id);
+        info!("script_config.evm_opts.fork_url: {:?}", script_config.evm_opts.fork_url);
+        info!("script_config.evm_opts.fork_block_number: {:?}", script_config.evm_opts.fork_block_number);
+        info!("script_config.evm_opts.env.block_number: {:?}", script_config.evm_opts.env.block_number);
+        info!("script_config.evm_opts.env.block_timestamp: {:?}", script_config.evm_opts.env.block_timestamp);
+        info!("script_config.evm_opts.env.block_difficulty: {:?}", script_config.evm_opts.env.block_difficulty);
+        info!("script_config.evm_opts.env.block_prevrandao: {:?}", script_config.evm_opts.env.block_prevrandao);
+        info!("script_config.evm_opts.env.block_gas_limit: {:?}", script_config.evm_opts.env.block_gas_limit);
+        info!("script_config.evm_opts.env.block_base_fee_per_gas: {:?}", script_config.evm_opts.env.block_base_fee_per_gas);
+        info!("script_config.evm_opts.env.block_coinbase: {:?}", script_config.evm_opts.env.block_coinbase);
+
         let target_contract = build_data.get_target_contract()?;
+        info!("target_contract: {:?}", target_contract.name);
 
         let bytecode = target_contract.bytecode().ok_or_eyre("target contract has no bytecode")?;
 
         let (func, calldata) = args.get_method_and_calldata(&target_contract.abi)?;
+        info!("func: {:?}", func.name);
 
         ensure_clean_constructor(&target_contract.abi)?;
 
@@ -101,6 +117,16 @@ impl LinkedState {
         } else {
             TweakData::new()
         };
+
+        // Log tweak data for debugging
+        for (addr, info) in tweak.iter() {
+            info!("execute.rs: Tweak data loaded - {} at Address: {:?}, Code length: {} bytes, ABI items: {}", 
+                info.name, addr, info.bytecode.len(), info.abi.len());
+            if info.bytecode.len() > 64 {
+                info!("execute.rs: Code preview - First 32 bytes: {:02x?}", &info.bytecode[..32]);
+                info!("execute.rs: Code preview - Last 32 bytes: {:02x?}", &info.bytecode[info.bytecode.len()-32..]);
+            }
+        }
 
         Ok(PreExecutionState {
             args,
@@ -134,6 +160,14 @@ impl PreExecutionState {
     /// Might require executing script twice in cases when we determine sender from execution.
     #[async_recursion]
     pub async fn execute(mut self) -> Result<ExecutedState> {
+        // Log before applying tweak
+        info!("execute.rs: About to apply tweak to backend with {} addresses", self.tweak_data.len());
+        for (addr, tweak_info) in self.tweak_data.iter() {
+            info!("execute.rs: Applying tweak - {} at Address: {:?}, Code length: {} bytes", 
+                tweak_info.name, addr, tweak_info.bytecode.len());
+        }
+        
+        // Apply tweak BEFORE creating executor (like forge replay does)
         let mut runner = self
             .script_config
             .get_runner_with_cheatcodes(
@@ -141,10 +175,54 @@ impl PreExecutionState {
                 self.script_wallets.clone(),
                 self.args.debug,
                 self.build_data.build_data.target.clone(),
+                Some(&self.tweak_data),
             )
             .await?;
-        tweak_backend(runner.executor.backend_mut(), &self.tweak_data)?;
+        
+        // Verify tweak was applied
+        for (addr, tweak_info) in self.tweak_data.iter() {
+            let account_info = runner.executor.backend_mut().basic(*addr)?;
+            if let Some(info) = account_info {
+                if let Some(ref code) = info.code {
+                    info!("execute.rs: Verification AFTER tweak - {} at Address {:?} has code length: {} bytes", 
+                        tweak_info.name, addr, code.len());
+                    
+                    // Check if code matches what we expect
+                    let code_bytes = code.original_bytes();
+                    if code_bytes.as_ref() == tweak_info.bytecode.as_ref() {
+                        info!("execute.rs: ✓ Code matches expected tweak");
+                    } else {
+                        warn!("execute.rs: ✗ Code DOES NOT match expected tweak! Expected {} bytes, got {} bytes", 
+                            tweak_info.bytecode.len(), code_bytes.len());
+                    }
+                } else {
+                    warn!("execute.rs: Verification - Address {:?} has NO code after tweak!", addr);
+                }
+            } else {
+                warn!("execute.rs: Verification - Address {:?} has NO account info after tweak!", addr);
+            }
+        }
+        
         let result = self.execute_with_runner(&mut runner).await?;
+        
+        // IMPORTANT: Verify code AGAIN after execution to see if it changed
+        info!("execute.rs: Verifying code AFTER execution...");
+        for (addr, tweak_info) in self.tweak_data.iter() {
+            let account_info = runner.executor.backend_mut().basic(*addr)?;
+            if let Some(info) = account_info {
+                if let Some(ref code) = info.code {
+                    info!("execute.rs: AFTER execution - {} at Address {:?} has code length: {} bytes", 
+                        tweak_info.name, addr, code.len());
+                    let code_bytes = code.original_bytes();
+                    if code_bytes.as_ref() == tweak_info.bytecode.as_ref() {
+                        info!("execute.rs: ✓ Code STILL matches expected tweak");
+                    } else {
+                        warn!("execute.rs: ✗ Code changed during execution! Expected {} bytes, got {} bytes", 
+                            tweak_info.bytecode.len(), code_bytes.len());
+                    }
+                }
+            }
+        }
 
         // If we have a new sender from execution, we need to use it to deploy libraries and relink
         // contracts.
@@ -169,6 +247,7 @@ impl PreExecutionState {
             build_data: self.build_data,
             execution_data: self.execution_data,
             execution_result: result,
+            tweak_data: self.tweak_data,
         })
     }
 
@@ -311,16 +390,21 @@ pub struct ExecutedState {
     pub build_data: LinkedBuildData,
     pub execution_data: ExecutionData,
     pub execution_result: ScriptResult,
+    pub tweak_data: TweakData,
 }
 
 impl ExecutedState {
     /// Collects the data we need for simulation and various post-execution tasks.
     pub async fn prepare_simulation(self) -> Result<PreSimulationState> {
+        info!("get returns");
         let returns = self.get_returns()?;
 
-        let decoder = self.build_trace_decoder(&self.build_data.known_contracts).await?;
+        info!("build_trace_decoder with tweaked ABIs");
+        let decoder = self.build_trace_decoder(&self.build_data.known_contracts, Some(&self.tweak_data)).await?;
 
+        info!("transactions.clone()");
         let txs = self.execution_result.transactions.clone().unwrap_or_default();
+        info!("RpcData::from_transactions");
         let rpc_data = RpcData::from_transactions(&txs);
 
         if rpc_data.is_multi_chain() {
@@ -351,17 +435,43 @@ impl ExecutedState {
     async fn build_trace_decoder(
         &self,
         known_contracts: &ContractsByArtifact,
+        tweak_data: Option<&TweakData>,
     ) -> Result<CallTraceDecoder> {
-        let mut decoder = CallTraceDecoderBuilder::new()
+        info!("CallTraceDecoderBuilder::new");
+        let mut decoder_builder = CallTraceDecoderBuilder::new()
             .with_labels(self.execution_result.labeled_addresses.clone())
             .with_verbosity(self.script_config.evm_opts.verbosity)
             .with_known_contracts(known_contracts)
             .with_signature_identifier(SignaturesIdentifier::new(
                 Config::foundry_cache_dir(),
                 self.script_config.config.offline,
-            )?)
-            .build();
+            )?);
+        
+        // Add tweaked ABIs to the decoder if provided
+        if let Some(tweaks) = tweak_data {
+            for (address, tweak_info) in tweaks {
+                let event_count = tweak_info.abi.events().count();
+                let debug_log_events: Vec<_> = tweak_info.abi.events()
+                    .filter(|e| e.name == "DebugLog" || e.name == "DebugLogNumber")
+                    .collect();
+                
+                info!("build_trace_decoder: Adding tweaked ABI for {} at {:?} ({} total ABI items, {} events, {} DebugLog events)", 
+                    tweak_info.name, address, tweak_info.abi.len(), event_count, debug_log_events.len());
+                
+                if !debug_log_events.is_empty() {
+                    for event in &debug_log_events {
+                        info!("build_trace_decoder: Found DebugLog event: {} with {} indexed inputs", 
+                            event.name, event.inputs.iter().filter(|i| i.indexed).count());
+                    }
+                }
+                
+                decoder_builder = decoder_builder.with_abi(&tweak_info.abi);
+            }
+        }
+        
+        let mut decoder = decoder_builder.build();
 
+        info!("TraceIdentifiers::new");
         let mut identifier = TraceIdentifiers::new().with_local(known_contracts).with_etherscan(
             &self.script_config.config,
             self.script_config.evm_opts.get_remote_chain_id().await,
@@ -375,6 +485,7 @@ impl ExecutedState {
             identifier.etherscan = None;
         }
 
+        info!("identify");
         for (_, trace) in &self.execution_result.traces {
             decoder.identify(trace, &mut identifier);
         }
@@ -509,12 +620,41 @@ impl PreSimulationState {
             }
         }
 
+        use foundry_evm::constants::HARDHAT_CONSOLE_ADDRESS;
+        
+        info!("show_traces: Total logs collected: {}", result.logs.len());
+        let mut console_address_logs = 0;
+        let mut other_logs = 0;
+        
+        for (i, log) in result.logs.iter().enumerate() {
+            let is_console = log.address == HARDHAT_CONSOLE_ADDRESS;
+            if is_console {
+                console_address_logs += 1;
+            } else {
+                other_logs += 1;
+            }
+            
+            if i < 10 || is_console {  // Log first 10 or all console logs
+                info!("show_traces: Log {}: address={:?} (is_console={}), topics={}, data_len={}", 
+                    i, log.address, is_console, log.topics().len(), log.data.data.len());
+                if is_console && !log.topics().is_empty() {
+                    info!("show_traces:   topic0={:?}", log.topics()[0]);
+                }
+            }
+        }
+        
+        info!("show_traces: Logs breakdown - {} from console address, {} from other addresses", 
+            console_address_logs, other_logs);
+        
         let console_logs = decode_console_logs(&result.logs);
+        info!("show_traces: Decoded console logs: {} (expected ~{})", console_logs.len(), console_address_logs);
         if !console_logs.is_empty() {
             shell::println("\n== Logs ==")?;
             for log in console_logs {
                 shell::println(format!("  {log}"))?;
             }
+        } else if !result.logs.is_empty() {
+            info!("show_traces: WARNING: {} logs collected but none decoded as console logs", result.logs.len());
         }
 
         if !result.success {

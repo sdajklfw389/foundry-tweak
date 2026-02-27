@@ -859,8 +859,33 @@ fn convert_executed_result(
     let InspectorData { mut logs, labels, traces, coverage, cheatcodes, chisel_state } =
         inspector.collect();
 
+    tracing::info!(
+        "convert_executed_result: Inspector logs: {}, exec_logs: {}",
+        logs.len(),
+        exec_logs.len()
+    );
+    
+    // Merge logs from both sources - exec_logs might contain logs that LogCollector missed
+    // (e.g., if LogCollector wasn't enabled for some calls, or if there are regular events)
     if logs.is_empty() {
         logs = exec_logs;
+    } else {
+        // Merge exec_logs into logs, avoiding duplicates
+        // Logs are considered duplicates if they have the same address, topics, and data
+        for exec_log in exec_logs {
+            let is_duplicate = logs.iter().any(|log| {
+                log.address == exec_log.address &&
+                log.topics() == exec_log.topics() &&
+                log.data.data == exec_log.data.data
+            });
+            if !is_duplicate {
+                logs.push(exec_log);
+            }
+        }
+        tracing::info!(
+            "convert_executed_result: After merge, total logs: {}",
+            logs.len()
+        );
     }
 
     let transactions = cheatcodes

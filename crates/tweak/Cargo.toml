@@ -48,7 +48,7 @@ eyre.workspace = true
 # proptest = "1"
 # rayon = "1"
 serde.workspace = true
-# tracing.workspace = true
+tracing.workspace = true
 yansi.workspace = true
 
 # # bin
@@ -60,7 +60,7 @@ foundry-cli.workspace = true
 # foundry-debugger.workspace = true
 
 # alloy-dyn-abi.workspace = true
-# alloy-json-abi.workspace = true
+alloy-json-abi.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-provider.workspace = true
 alloy-rpc-types.workspace = true

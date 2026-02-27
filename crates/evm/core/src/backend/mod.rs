@@ -451,7 +451,7 @@ impl Backend {
     ///
     /// Prefer using [`spawn`](Self::spawn) instead.
     pub fn new(forks: MultiFork, fork: Option<CreateFork>) -> Self {
-        trace!(target: "backend", forking_mode=?fork.is_some(), "creating executor backend");
+        info!(target: "backend", forking_mode=?fork.is_some(), "creating executor backend");
         // Note: this will take of registering the `fork`
         let inner = BackendInner {
             persistent_accounts: HashSet::from(DEFAULT_PERSISTENT_ACCOUNTS),
@@ -479,7 +479,7 @@ impl Backend {
             backend.active_fork_ids = Some(fork_ids);
         }
 
-        trace!(target: "backend", forking_mode=? backend.active_fork_ids.is_some(), "created executor backend");
+        info!(target: "backend", forking_mode=? backend.active_fork_ids.is_some(), "created executor backend");
 
         backend
     }
@@ -977,7 +977,7 @@ impl DatabaseExt for Backend {
     }
 
     fn create_fork(&mut self, create_fork: CreateFork) -> eyre::Result<LocalForkId> {
-        trace!("create fork");
+        info!("create fork");
         let (fork_id, fork, _) = self.forks.create_fork(create_fork)?;
 
         let fork_db = ForkDB::new(fork);
@@ -991,7 +991,7 @@ impl DatabaseExt for Backend {
         fork: CreateFork,
         transaction: B256,
     ) -> eyre::Result<LocalForkId> {
-        trace!(?transaction, "create fork at transaction");
+        info!(?transaction, "create fork at transaction");
         let id = self.create_fork(fork)?;
         let fork_id = self.ensure_fork_id(id).cloned()?;
         let mut env = self
